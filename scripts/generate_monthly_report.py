@@ -157,6 +157,14 @@ GOAL_HINTS = {
     ),
 }
 
+PERSONAL_GROWTH_HINTS = {
+    "AI Agent与自动化工作流": "提升 AI Agent 设计、自动化编排与工具化沉淀能力，增强把经验固化为可复用资产的能力。",
+    "业务研发与复杂问题排障": "提升复杂问题定位、跨模块联调与业务落地能力，增强对关键问题的闭环推进能力。",
+    "工程方法论与质量体系沉淀": "提升架构抽象、工程规范与质量治理能力，沉淀更可复用的方法、流程与标准。",
+    "组织协同与人才事项": "提升跨团队协同、评审沟通、经验传递与人才判断能力，增强组织协作影响力。",
+    FALLBACK_THEME: "提升多线任务统筹和结果导向表达能力，增强对零散事项的收敛与闭环能力。",
+}
+
 
 @dataclass(frozen=True)
 class DateWindow:
@@ -514,86 +522,130 @@ def format_lines(lines: list[str]) -> str:
     return "<br>".join(line for line in lines if line)
 
 
-def infer_target(bucket: ThemeBucket, journal_hints: list[str]) -> str:
-    org_goal, personal_goal = GOAL_HINTS.get(bucket.label, GOAL_HINTS[FALLBACK_THEME])
-    lines = [
-        f"组织目标：{org_goal}",
-        f"个人目标：{personal_goal}",
-    ]
-    if journal_hints:
-        lines.append(f"Journal 线索：{journal_hints[0]}")
-    else:
-        lines.append("说明：以上目标主要根据 Dayflow / GitLab 活动轨迹保守推断。")
-    return format_lines(lines)
+def format_bullets(lines: list[str]) -> str:
+    items = [line.strip() for line in lines if line and line.strip()]
+    return "<br>".join(f"- {item}" for item in items)
+
+
+def tidy_name(name: str) -> str:
+    compact = name.strip()
+    if "/" in compact:
+        compact = compact.split("/")[-1]
+    return compact
+
+
+def display_projects(events: list[dict[str, Any]], limit: int = 3) -> list[str]:
+    return [tidy_name(name) for name in project_names(events, limit=limit)]
+
+
+def display_titles(bucket: ThemeBucket, limit: int = 4) -> list[str]:
+    titles = top_card_titles(bucket.cards, limit=limit)
+    extra_titles = [title for title in top_event_titles(bucket.events, limit=limit) if title not in titles]
+    return (titles + extra_titles)[:limit]
+
+
+def organization_goal_text(bucket: ThemeBucket) -> str:
+    projects = display_projects(bucket.events, limit=3)
+    if projects:
+        if bucket.label == "AI Agent与自动化工作流":
+            return f"围绕 {'、'.join(projects)} 等项目推进智能能力、自动化工作流与配套工具的落地交付。"
+        if bucket.label == "业务研发与复杂问题排障":
+            return f"围绕 {'、'.join(projects)} 等项目推进功能迭代、问题修复与关键链路稳定性优化。"
+        if bucket.label == "工程方法论与质量体系沉淀":
+            return f"围绕 {'、'.join(projects)} 等项目推进工程治理、质量优化与方法沉淀相关交付。"
+        return f"围绕 {'、'.join(projects)} 等项目推进协同事项、评审支持与组织相关工作的落地。"
+
+    titles = display_titles(bucket, limit=2)
+    if titles:
+        return f"围绕 {'、'.join(titles)} 等事项推进阶段性交付与结果落地。"
+    return GOAL_HINTS.get(bucket.label, GOAL_HINTS[FALLBACK_THEME])[0]
+
+
+def delivery_stage_text(bucket: ThemeBucket) -> str:
+    counts = action_counts(bucket.events)
+    accepted = counts.get("accepted", 0)
+    opened = counts.get("opened", 0)
+    pushed = counts.get("pushed to", 0) + counts.get("pushed new", 0)
+    if accepted > 0:
+        return "部分事项已完成提交、评审与合入，阶段性成果较明确。"
+    if opened > 0:
+        return "相关事项已推进到提交与评审阶段，交付节奏稳定。"
+    if pushed > 0:
+        return "相关改造已形成持续代码输出，交付推进较扎实。"
+    return "相关事项以过程性推进为主，闭环情况需结合其他材料补证。"
+
+
+def build_goal(bucket: ThemeBucket, journal_hints: list[str]) -> str:
+    del journal_hints
+    return format_bullets(
+        [
+            organization_goal_text(bucket),
+            PERSONAL_GROWTH_HINTS.get(bucket.label, PERSONAL_GROWTH_HINTS[FALLBACK_THEME]),
+        ]
+    )
 
 
 def build_key_results(bucket: ThemeBucket) -> str:
-    hours, person_days = hours_and_days(bucket.cards)
     lines: list[str] = []
-    if bucket.cards:
-        lines.append(
-            f"Dayflow：记录到 {len(bucket.cards)} 条工作卡片，覆盖 {distinct_active_days(bucket.cards)} 天，累计 {hours:.2f} 小时 / {person_days:.2f} D。"
-        )
-    if bucket.events:
-        counts = action_counts(bucket.events)
-        action_text = "、".join(f"{action} {count} 次" for action, count in counts.most_common(3))
-        projects = "、".join(project_names(bucket.events)) or "项目分布待补证"
-        lines.append(f"GitLab：记录到 {len(bucket.events)} 次事件，主要动作为 {action_text}，主要涉及 {projects}。")
-    card_titles = top_card_titles(bucket.cards)
-    event_titles = top_event_titles(bucket.events)
-    representatives = card_titles + [title for title in event_titles if title not in card_titles]
-    if representatives:
-        lines.append(f"代表性事项：{'；'.join(representatives[:4])}。")
+    projects = display_projects(bucket.events, limit=3)
+    deliverables = display_titles(bucket, limit=4)
+    if projects:
+        lines.append(f"交付项目：{'、'.join(projects)}")
+    if deliverables:
+        lines.append(f"代表性交付：{'；'.join(deliverables)}")
+    lines.append(f"阶段结果：{delivery_stage_text(bucket)}")
     if not lines:
         lines.append("说明：本任务拆分缺少足够的 Dayflow / GitLab 证据，建议补充其他系统记录。")
-    return format_lines(lines)
+    return format_bullets(lines)
 
 
 def build_key_actions(bucket: ThemeBucket) -> str:
-    titles = top_card_titles(bucket.cards)
-    projects = project_names(bucket.events)
+    titles = display_titles(bucket, limit=3)
+    projects = display_projects(bucket.events, limit=3)
     delay_signals = count_delay_signals(bucket.cards, bucket.events)
     lines: list[str] = []
     if titles:
-        lines.append(f"关键动作：围绕 {'、'.join(titles[:3])} 持续推进，形成连续工作块。")
+        lines.append(f"关键动作：围绕 {'、'.join(titles[:3])} 持续推进")
     if projects:
-        lines.append(f"GitLab推进：主要围绕 {'、'.join(projects[:3])} 持续提交 / MR 推进，与组织交付目标保持对齐。")
+        lines.append(f"对齐组织目标：聚焦 {'、'.join(projects[:3])} 的交付推进与质量优化")
     if delay_signals > 0:
-        lines.append(f"延期情况：发现 {delay_signals} 处潜在阻塞或待跟进信号，建议结合 MR / issue 进一步复核。")
+        lines.append("延期情况：存在少量潜在阻塞或待跟进信号，建议评审时继续复核闭环状态")
     else:
         lines.append("延期情况：未从 Dayflow / GitLab 数据中看到明确延期证据。")
-    return format_lines(lines)
+    return format_bullets(lines)
 
 
 def build_completion(bucket: ThemeBucket) -> str:
-    hours, _ = hours_and_days(bucket.cards)
     counts = action_counts(bucket.events)
     opened = counts.get("opened", 0)
     accepted = counts.get("accepted", 0)
-    pushed = counts.get("pushed to", 0) + counts.get("pushed new", 0)
-    title_count = len({title for title in top_card_titles(bucket.cards, limit=10)})
+    active_days = distinct_active_days(bucket.cards)
 
-    success = f"成效：本主题投入约 {hours:.2f} 小时，并形成 {len(bucket.cards)} 条 Dayflow 工作卡片、{len(bucket.events)} 次 GitLab 事件，说明推进较为持续。"
-    if title_count >= 6:
-        problem = "问题：本主题下的事项较多，存在一定上下文切换，整理与归档成本偏高。"
-    elif bucket.events and accepted == 0 and pushed > 0:
-        problem = "问题：GitLab 侧更多体现为持续提交，闭环类动作证据相对有限。"
+    if accepted > 0:
+        success = "成效：事项已推进到提交评审并形成阶段性闭环，整体交付较扎实。"
+    elif bucket.events:
+        success = "成效：事项保持持续推进，已形成明确交付输出。"
     else:
-        problem = "问题：未看到明显异常，但部分交付闭环仍需要结合其他系统补证。"
+        success = "成效：事项在本月保持持续推进。"
+
+    if active_days >= 10:
+        problem = "问题：推进周期较长，阶段内存在多线并行和上下文切换。"
+    else:
+        problem = "问题：部分结果仍需补充业务上下文，便于评审理解闭环价值。"
 
     if opened > accepted:
-        risk = "风险：已打开事项多于已合入事项，说明仍有部分工作处于推进中，后续需要继续跟进闭环。"
+        risk = "风险：部分事项仍在推进或评审中，若收尾不够集中，可能影响阶段性闭环质量。"
     elif count_delay_signals(bucket.cards, bucket.events) > 0:
-        risk = "风险：存在潜在延期或阻塞信号，若不及时跟进可能影响后续节奏。"
+        risk = "风险：仍有少量待确认或待跟进事项，若复核不及时，可能影响后续节奏。"
     else:
-        risk = "风险：未从当前两类数据中看到明确延期证据，但上线效果、业务结果仍需结合其他记录复核。"
+        risk = "风险：未见明确延期证据，但最终业务效果和验收结果仍建议结合发布或评审记录确认。"
 
-    if projects := project_names(bucket.events):
-        measures = f"措施：继续围绕 {'、'.join(projects[:2])} 聚焦推进，并补充 MR、issue 或发布记录作为闭环证据。"
+    if projects := display_projects(bucket.events, limit=2):
+        measures = f"措施：围绕 {'、'.join(projects[:2])} 继续聚焦收尾，并补齐评审结论、发布信息和复盘沉淀。"
     else:
-        measures = "措施：建议补充相关 MR、issue、文档或发布记录，增强闭环与复盘证据。"
+        measures = "措施：补齐评审结论、文档记录或发布信息，增强结果表达与闭环证明。"
 
-    return format_lines([success, problem, risk, measures])
+    return format_bullets([success, problem, risk, measures])
 
 
 def build_work_quality(bucket: ThemeBucket) -> str:
@@ -602,12 +654,12 @@ def build_work_quality(bucket: ThemeBucket) -> str:
     accepted = counts.get("accepted", 0)
     pushed = counts.get("pushed to", 0) + counts.get("pushed new", 0)
     if hours >= 40:
-        return "较高：该主题投入时间长，且伴随明显提交或 MR 闭环动作，交付连续性较强。"
+        return "较高：该主题投入持续、推进节奏稳定，且能看到较明确的交付收敛与结果沉淀。"
     if accepted >= 8 or pushed >= 20:
-        return "较高：虽然 Dayflow 工时占比不高，但 GitLab 侧存在密集提交或 MR 闭环，说明交付动作较集中。"
+        return "较高：虽然显性工时不算最高，但交付动作集中、输出连续，说明整体执行质量较好。"
     if hours >= 16 or pushed >= 10:
-        return "稳定：能看到持续推进与交付轨迹，但仍有部分结果需要结合更多证据确认。"
-    return "常规：当前证据能证明在推进，但深度与闭环程度相对有限。"
+        return "稳定：能看到持续推进与较明确的输出轨迹，整体质量处于稳步推进状态。"
+    return "常规：当前能够证明事项在推进，但成果表达与闭环证据仍有继续加强空间。"
 
 
 def build_difficulty(bucket: ThemeBucket) -> str:
@@ -635,13 +687,13 @@ def build_difficulty(bucket: ThemeBucket) -> str:
 
 
 def build_notes(bucket: ThemeBucket) -> str:
-    notes = ["工时和人天仅根据 Dayflow 数据折算。"]
+    notes = ["工时和人天仅根据 Dayflow 数据折算；其余内容基于 Dayflow 与 GitLab 轨迹综合归纳。"]
     if not bucket.cards:
-        notes.append("本行主要依据 GitLab 事件归纳，缺少对应 Dayflow 工时。")
+        notes.append("本行主要依据 GitLab 轨迹归纳，缺少对应的 Dayflow 工时佐证。")
     if not bucket.events:
-        notes.append("本行未匹配到 GitLab 事件，可能属于非 GitLab 交付或线下工作。")
-    notes.append("目标、质量和难易度含保守推断成分。")
-    return format_lines(notes)
+        notes.append("本行未匹配到 GitLab 记录，可能属于非 GitLab 交付或线下推进事项。")
+    notes.append("目标、质量和难易度含保守推断成分，建议结合评审材料进一步确认。")
+    return format_bullets(notes)
 
 
 def build_monthly_reflection(
@@ -655,47 +707,41 @@ def build_monthly_reflection(
         top_buckets.append((bucket.label, hours, person_days, len(bucket.events)))
     top_buckets = sorted(top_buckets, key=lambda item: (-item[1], -item[3], item[0]))
 
-    top_theme_text = "、".join(
-        f"{label}（{hours:.2f} 小时 / {person_days:.2f} D）"
-        for label, hours, person_days, _ in top_buckets[:3]
-        if hours > 0
-    )
+    top_theme_text = "、".join(label for label, hours, _person_days, _event_count in top_buckets[:3] if hours > 0)
     if not top_theme_text:
         top_theme_text = "本月主题分布较分散，暂未形成明显的单一高投入主题。"
 
-    dayflow_aggregates = dayflow_payload.get("aggregates", {})
     gitlab_aggregates = gitlab_payload.get("aggregates", {})
     accepted = gitlab_aggregates.get("by_action", {}).get("accepted", 0)
-    pushed = gitlab_aggregates.get("by_action", {}).get("pushed to", 0) + gitlab_aggregates.get("by_action", {}).get("pushed new", 0)
     journal_count = len(dayflow_payload.get("journal_entries", []))
 
     growth_lines = [
-        f"从本月活动轨迹看，主要精力集中在 {top_theme_text}，说明本月已经形成较清晰的阶段性投入重心。",
-        f"结合 GitLab 记录，本月累计有 {pushed} 次提交动作、{accepted} 次合入 / 接受动作，说明不少事项已经从执行推进到了交付闭环或接近闭环。",
+        f"从本月整体推进情况看，主要投入集中在 {top_theme_text} 等方向，说明本月的工作重心比较清晰，也形成了相对稳定的推进主线。",
+        "结合 Dayflow 与 GitLab 轨迹，可以看到多项事项已经从执行推进逐步走向提交评审与阶段性闭环，说明结果导向和交付意识在持续增强。",
     ]
     if top_buckets and top_buckets[0][0] == "AI Agent与自动化工作流":
-        growth_lines.append("在 AI Agent、skill 和自动化工作流方面的投入较深，说明本月在“把能力固化为工具资产”上有明显成长。")
+        growth_lines.append("在 AI Agent、skill 和自动化工作流方面的投入较深，说明本月在“把经验沉淀成工具能力”和“把想法转成可复用资产”上有比较明显的成长。")
     elif top_buckets and top_buckets[0][0] == "工程方法论与质量体系沉淀":
-        growth_lines.append("工程质量与方法沉淀类事项占比较高，说明本月不只是做交付，也在持续积累可复用的方法和规范。")
+        growth_lines.append("工程质量与方法沉淀类事项占比较高，说明本月不只是完成交付，也在持续积累可复用的方法、规范与工程实践。")
     else:
-        growth_lines.append("从高频主题看，本月已经不只是零散处理任务，而是在若干重点方向上形成了持续推进和沉淀。")
+        growth_lines.append("从高频主题看，本月已经不只是零散处理任务，而是在几个重点方向上形成了持续推进和阶段性沉淀。")
 
     delay_signals = sum(count_delay_signals(bucket.cards, bucket.events) for bucket in buckets)
     reflection_lines = []
     if len([bucket for bucket in buckets if hours_and_days(bucket.cards)[0] > 0]) >= 4:
-        reflection_lines.append("本月任务线偏多，存在较明显的上下文切换；后续可以进一步压缩并行主题，减少精力分散。")
+        reflection_lines.append("本月任务线相对偏多，阶段内存在比较明显的上下文切换；后续需要更主动地压缩并行主题，提升精力聚焦度。")
     if delay_signals > 0:
-        reflection_lines.append(f"从 Dayflow / GitLab 轨迹里能看到约 {delay_signals} 处潜在阻塞或待跟进信号，说明风险暴露和节奏管理还可以更前置。")
+        reflection_lines.append("从过程轨迹里仍能看到少量阻塞或待跟进信号，说明风险识别与推进节奏管理还可以再前置一些。")
     if gitlab_aggregates.get("by_action", {}).get("opened", 0) > accepted:
-        reflection_lines.append("已打开事项多于已闭环事项，说明部分工作仍停留在推进中，后续要更关注收尾和闭环证据沉淀。")
+        reflection_lines.append("部分事项仍停留在推进或评审阶段，后续需要更关注收尾动作，以及对阶段结果的文档化和闭环沉淀。")
     if journal_count == 0:
-        reflection_lines.append("本月几乎没有 journal 目标/反思记录，导致月报中的部分目标与反思只能根据活动轨迹推断，建议下月加强主动沉淀。")
+        reflection_lines.append("本月较少留下明确的目标与反思记录，导致部分总结只能依赖活动轨迹反推；下月建议加强主动记录和阶段复盘。")
     if not reflection_lines:
-        reflection_lines.append("本月整体推进较稳，但仍建议在每周固定补一次目标、风险与复盘记录，避免月底回顾过度依赖轨迹推断。")
+        reflection_lines.append("本月整体推进较稳，但仍建议每周固定补一次目标、风险与复盘记录，避免月底回顾过度依赖轨迹推断。")
 
     return {
-        "收获/启发/成长": format_lines(growth_lines),
-        "反思/自我批评": format_lines(reflection_lines),
+        "收获/启发/成长": format_bullets(growth_lines),
+        "反思/自我批评": format_bullets(reflection_lines),
     }
 
 
@@ -712,7 +758,7 @@ def build_rows(
     for bucket in buckets:
         hours, person_days = hours_and_days(bucket.cards)
         row = {
-            HEADERS[0]: infer_target(bucket, journal_hints),
+            HEADERS[0]: build_goal(bucket, journal_hints),
             HEADERS[1]: build_key_results(bucket),
             HEADERS[2]: build_key_actions(bucket),
             HEADERS[3]: build_completion(bucket),

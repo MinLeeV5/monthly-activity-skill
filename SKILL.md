@@ -1,6 +1,6 @@
 ---
 name: monthly-activity-skill
-description: 使用 `dayflow-skill` 采集本机 Dayflow 数据，并通过 `glab` 读取 GitLab 活动事件，按月或自定义时间范围生成中文工作总结表格。适用于每月工作总结、基于 Dayflow 和 GitLab 证据回顾工作拆分、或为月报补充工时与代码协作线索。
+description: 内置读取本机 Dayflow 时间线数据，并通过 `glab` 读取 GitLab 活动事件，按月或自定义时间范围生成中文工作总结表格。使用前会先检查设备是否安装 Dayflow；若未安装或缺少数据库，则自动降级为 GitLab-only 总结。适用于每月工作总结、基于 Dayflow 和 GitLab 证据回顾工作拆分、或在没有 Dayflow 的设备上先输出轻量月报。
 ---
 
 # 月度工作总结
@@ -9,8 +9,8 @@ description: 使用 `dayflow-skill` 采集本机 Dayflow 数据，并通过 `gla
 
 ## 快速开始
 
-1. 确保 `dayflow-skill` 可用，并且能正常运行 `scripts/read_dayflow.py`
-2. 确保 `glab` 已安装且已经登录目标 GitLab 主机
+1. 确保 `glab` 已安装且已经登录目标 GitLab 主机
+2. 如需完整工时视角，确保设备存在 Dayflow 应用或可访问的 Dayflow 数据库
 3. 运行总脚本：
    ```bash
    python3 scripts/generate_monthly_report.py --month 2026-03 --gitlab-hostname gitlab.gz.cvte.cn
@@ -19,14 +19,13 @@ description: 使用 `dayflow-skill` 采集本机 Dayflow 数据，并通过 `gla
 
 ## 工作流
 
-### 1. 先读取 Dayflow
+### 1. 先探测 Dayflow，再决定是否读取
 
-- 必须复用 `dayflow-skill` 的读取脚本，不要在这里重复实现 Dayflow SQL
-- 通过 `--dayflow-skill-dir` 或环境变量 `DAYFLOW_SKILL_DIR` 指定 skill 路径
-- 如果未显式指定，脚本会依次尝试：
-  - 当前仓库的同级目录 `../dayflow-skill`
-  - `~/.codex/skills/dayflow-skill`
-  - 兼容旧安装目录 `~/.codex/skills/dayflow-work-summary`
+- 优先检查 Dayflow 应用路径，默认是 `/Applications/Dayflow.app`
+- 再检查数据库路径，默认是 `~/Library/Application Support/Dayflow/chunks.sqlite`
+- 如果显式传入 `--dayflow-db-path`，即使当前设备未安装 Dayflow App，也允许直接读取该数据库
+- 常规场景统一使用内置脚本 `scripts/read_dayflow.py`，不要重复实现 Dayflow SQL
+- `--dayflow-skill-dir` 与 `DAYFLOW_SKILL_DIR` 仅保留为兼容旧配置的后备选项
 
 ### 2. 再读取 GitLab
 
@@ -38,7 +37,7 @@ description: 使用 `dayflow-skill` 采集本机 Dayflow 数据，并通过 `gla
 ### 3. 生成月报表格
 
 - 输出字段固定为：
-  - `目标（含组织与个人）`
+  - `目标`
   - `关键成果（交付物/数据）`
   - `关键行动举措（对齐组织目标拆解，需体现延期情况）`
   - `完成情况（成效、问题、风险、措施）`
@@ -51,7 +50,8 @@ description: 使用 `dayflow-skill` 采集本机 Dayflow 数据，并通过 `gla
   - `| 类别 | 分享 |`
   - `| 收获/启发/成长 | ... |`
   - `| 反思/自我批评 | ... |`
-- 工时与 D 只来自 Dayflow；GitLab 作为交付、协作、MR/提交线索的补充证据
+- Dayflow 可用时，工时与 D 来自 Dayflow；GitLab 作为交付、协作、MR/提交线索的补充证据
+- 未检测到 Dayflow 时，允许继续输出 GitLab-only 月报，但工时 / D 暂缺
 - 无法直接证明的内容必须标注为保守判断或推断
 - `目标` 仍然是一列，但单元格内建议拆成 2 条短 bullet
 - 第 1 条写这一行任务拆分对应的项目交付目标，第 2 条写对应的能力成长或沉淀目标
@@ -66,6 +66,10 @@ description: 使用 `dayflow-skill` 采集本机 Dayflow 数据，并通过 `gla
   ```bash
   python3 scripts/generate_monthly_report.py --month 2026-03 --gitlab-hostname gitlab.gz.cvte.cn
   ```
+- 显式指定 Dayflow 数据库：
+  ```bash
+  python3 scripts/generate_monthly_report.py --month 2026-03 --gitlab-hostname gitlab.gz.cvte.cn --dayflow-db-path ~/Library/Application\ Support/Dayflow/chunks.sqlite
+  ```
 - 生成 JSON 结构：
   ```bash
   python3 scripts/generate_monthly_report.py --month 2026-03 --gitlab-hostname gitlab.gz.cvte.cn --format json
@@ -77,5 +81,6 @@ description: 使用 `dayflow-skill` 采集本机 Dayflow 数据，并通过 `gla
 
 ## 参考资料
 
+- Dayflow 数据读取说明：`references/dayflow-data.md`
 - 表格规则与字段要求：`references/report-format.md`
 - GitLab 采集方式与事件解释：`references/gitlab-data.md`

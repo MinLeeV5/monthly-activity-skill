@@ -25,6 +25,9 @@ HEADERS = [
     "备注",
 ]
 
+REFLECTION_HEADERS = ["类别", "分享"]
+REFLECTION_ROWS = ["收获/启发/成长", "反思/自我批评"]
+
 FALLBACK_THEME = "其他业务推进事项"
 DELAY_KEYWORDS = ["延期", "delay", "blocked", "阻塞", "卡住", "返工", "待跟进", "reopen", "reopened"]
 
@@ -641,6 +644,61 @@ def build_notes(bucket: ThemeBucket) -> str:
     return format_lines(notes)
 
 
+def build_monthly_reflection(
+    buckets: list[ThemeBucket],
+    dayflow_payload: dict[str, Any],
+    gitlab_payload: dict[str, Any],
+) -> dict[str, str]:
+    top_buckets = []
+    for bucket in buckets:
+        hours, person_days = hours_and_days(bucket.cards)
+        top_buckets.append((bucket.label, hours, person_days, len(bucket.events)))
+    top_buckets = sorted(top_buckets, key=lambda item: (-item[1], -item[3], item[0]))
+
+    top_theme_text = "、".join(
+        f"{label}（{hours:.2f} 小时 / {person_days:.2f} D）"
+        for label, hours, person_days, _ in top_buckets[:3]
+        if hours > 0
+    )
+    if not top_theme_text:
+        top_theme_text = "本月主题分布较分散，暂未形成明显的单一高投入主题。"
+
+    dayflow_aggregates = dayflow_payload.get("aggregates", {})
+    gitlab_aggregates = gitlab_payload.get("aggregates", {})
+    accepted = gitlab_aggregates.get("by_action", {}).get("accepted", 0)
+    pushed = gitlab_aggregates.get("by_action", {}).get("pushed to", 0) + gitlab_aggregates.get("by_action", {}).get("pushed new", 0)
+    journal_count = len(dayflow_payload.get("journal_entries", []))
+
+    growth_lines = [
+        f"从本月活动轨迹看，主要精力集中在 {top_theme_text}，说明本月已经形成较清晰的阶段性投入重心。",
+        f"结合 GitLab 记录，本月累计有 {pushed} 次提交动作、{accepted} 次合入 / 接受动作，说明不少事项已经从执行推进到了交付闭环或接近闭环。",
+    ]
+    if top_buckets and top_buckets[0][0] == "AI Agent与自动化工作流":
+        growth_lines.append("在 AI Agent、skill 和自动化工作流方面的投入较深，说明本月在“把能力固化为工具资产”上有明显成长。")
+    elif top_buckets and top_buckets[0][0] == "工程方法论与质量体系沉淀":
+        growth_lines.append("工程质量与方法沉淀类事项占比较高，说明本月不只是做交付，也在持续积累可复用的方法和规范。")
+    else:
+        growth_lines.append("从高频主题看，本月已经不只是零散处理任务，而是在若干重点方向上形成了持续推进和沉淀。")
+
+    delay_signals = sum(count_delay_signals(bucket.cards, bucket.events) for bucket in buckets)
+    reflection_lines = []
+    if len([bucket for bucket in buckets if hours_and_days(bucket.cards)[0] > 0]) >= 4:
+        reflection_lines.append("本月任务线偏多，存在较明显的上下文切换；后续可以进一步压缩并行主题，减少精力分散。")
+    if delay_signals > 0:
+        reflection_lines.append(f"从 Dayflow / GitLab 轨迹里能看到约 {delay_signals} 处潜在阻塞或待跟进信号，说明风险暴露和节奏管理还可以更前置。")
+    if gitlab_aggregates.get("by_action", {}).get("opened", 0) > accepted:
+        reflection_lines.append("已打开事项多于已闭环事项，说明部分工作仍停留在推进中，后续要更关注收尾和闭环证据沉淀。")
+    if journal_count == 0:
+        reflection_lines.append("本月几乎没有 journal 目标/反思记录，导致月报中的部分目标与反思只能根据活动轨迹推断，建议下月加强主动沉淀。")
+    if not reflection_lines:
+        reflection_lines.append("本月整体推进较稳，但仍建议在每周固定补一次目标、风险与复盘记录，避免月底回顾过度依赖轨迹推断。")
+
+    return {
+        "收获/启发/成长": format_lines(growth_lines),
+        "反思/自我批评": format_lines(reflection_lines),
+    }
+
+
 def table_escape(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", "<br>")
 
@@ -667,12 +725,18 @@ def build_rows(
     return rows
 
 
-def render_markdown(window: DateWindow, rows: list[dict[str, str]], dayflow_payload: dict[str, Any], gitlab_payload: dict[str, Any]) -> str:
+def render_markdown(
+    window: DateWindow,
+    rows: list[dict[str, str]],
+    reflection: dict[str, str],
+    dayflow_payload: dict[str, Any],
+    gitlab_payload: dict[str, Any],
+) -> str:
     lines = [
         f"# 月度工作总结（{window.label}）",
         "",
         f"数据来源：Dayflow `{dayflow_payload['source']['db_path']}` + GitLab `{gitlab_payload['source']['hostname']}`",
-        "说明：表头固定，每一行代表一个任务拆分；工时仅根据 Dayflow 折算，D 按 8 小时/天计算。",
+        "说明：主表中每一行代表一个任务拆分；工时仅根据 Dayflow 折算，D 按 8 小时/天计算。",
         "",
         "| " + " | ".join(HEADERS) + " |",
         "| " + " | ".join(["---"] * len(HEADERS)) + " |",
@@ -680,6 +744,17 @@ def render_markdown(window: DateWindow, rows: list[dict[str, str]], dayflow_payl
     for row in rows:
         values = [table_escape(row[header]) for header in HEADERS]
         lines.append("| " + " | ".join(values) + " |")
+    lines.extend(
+        [
+            "",
+            "## 本月收获与反思",
+            "",
+            "| " + " | ".join(REFLECTION_HEADERS) + " |",
+            "| " + " | ".join(["--"] * len(REFLECTION_HEADERS)) + " |",
+        ]
+    )
+    for label in REFLECTION_ROWS:
+        lines.append("| " + table_escape(label) + " | " + table_escape(reflection[label]) + " |")
     return "\n".join(lines)
 
 
@@ -694,9 +769,10 @@ def main() -> int:
     events = gitlab_payload.get("events", [])
     buckets = build_theme_buckets(cards, events)
     rows = build_rows(buckets, dayflow_payload.get("journal_entries", []))
+    reflection = build_monthly_reflection(buckets, dayflow_payload, gitlab_payload)
 
     if args.format == "markdown":
-        sys.stdout.write(render_markdown(window, rows, dayflow_payload, gitlab_payload))
+        sys.stdout.write(render_markdown(window, rows, reflection, dayflow_payload, gitlab_payload))
         sys.stdout.write("\n")
         return 0
 
@@ -711,6 +787,7 @@ def main() -> int:
             "gitlab": gitlab_payload.get("source", {}),
         },
         "rows": rows,
+        "monthly_reflection": reflection,
     }
     indent = None if args.indent <= 0 else args.indent
     json.dump(payload, sys.stdout, ensure_ascii=False, indent=indent)

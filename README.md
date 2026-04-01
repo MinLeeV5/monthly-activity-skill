@@ -1,6 +1,6 @@
 # monthly-activity-skill
 
-一个面向 Codex 的月度工作总结 skill：通过 `dayflow-skill` 读取 Dayflow 时间线数据，通过 `glab` 读取 GitLab 活动事件，最终输出“字段为表头、每行一个任务拆分”的中文 Markdown 表格。
+一个面向 Codex 的月度工作总结 skill：通过 `dayflow-skill` 读取 Dayflow 时间线数据，通过 `glab` 读取 GitLab 活动事件，最终输出“字段为表头、每行一个任务拆分”的中文 Markdown 主表，并追加一张“本月收获与反思”附表。
 
 ## 解决的问题
 
@@ -11,6 +11,7 @@
 - 把两类数据汇总成月度工作总结
 - 固化固定表头的 Markdown 表格格式
 - 输出每个任务拆分的工时、人天、完成情况、工作质量与难易度
+- 补充输出“本月收获与反思”附表
 
 ## 前置依赖
 
@@ -79,7 +80,11 @@ python3 scripts/fetch_gitlab_events.py --month 2026-03 --hostname gitlab.gz.cvte
 
 ## 输出格式
 
-月报默认输出一张 Markdown 表格，表头固定为：
+月报默认输出两张 Markdown 表：
+
+### 1. 主任务拆分表
+
+表头固定为：
 
 - `目标（含组织与个人）`
 - `关键成果（交付物/数据）`
@@ -96,6 +101,19 @@ python3 scripts/fetch_gitlab_events.py --month 2026-03 --hostname gitlab.gz.cvte
 - 工时和人天只根据 Dayflow 数据折算
 - GitLab 数据用于补充提交、MR、项目推进和协作证据
 - 无法直接验证的结论会明确写成保守判断或推断
+
+### 2. 本月收获与反思附表
+
+固定格式为：
+
+```markdown
+## 本月收获与反思
+
+| 类别 | 分享 |
+| -- | -- |
+| 收获/启发/成长 | ... |
+| 反思/自我批评 | ... |
+```
 
 ## 设计原则
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -30,9 +31,18 @@ REFLECTION_ROWS = ["收获/启发/成长", "反思/自我批评"]
 
 DEFAULT_DAYFLOW_APP_PATH = Path("/Applications/Dayflow.app")
 DEFAULT_DAYFLOW_DB_PATH = Path.home() / "Library" / "Application Support" / "Dayflow" / "chunks.sqlite"
+MATCH_SPLIT_RE = re.compile(r"[\s,，；;、/\\|\n\r\t\-\+\(\)\[\]（）【】:：]+")
+ASCII_WORD_RE = re.compile(r"^[a-z0-9.]+$")
 
 FALLBACK_THEME = "其他业务推进事项"
 DELAY_KEYWORDS = ["延期", "delay", "blocked", "阻塞", "卡住", "返工", "待跟进", "reopen", "reopened"]
+LARK_GROWTH_HINTS = {
+    "产品": "需求抽象、方案推进与结果闭环能力。",
+    "项目": "项目拆解、节奏管理与跨团队协同能力。",
+    "效果": "效果评估、方案打磨与体验判断能力。",
+    "质量": "质量治理、风险识别与稳定性建设能力。",
+}
+DONE_STATUS_KEYWORDS = ["完成", "定版", "送测", "accepted", "merged", "closed", "done"]
 
 THEME_RULES: list[tuple[str, list[str]]] = [
     (
@@ -186,6 +196,9 @@ class ThemeBucket:
     label: str
     cards: list[dict[str, Any]]
     events: list[dict[str, Any]]
+    source: str = "theme"
+    goal_context: dict[str, Any] | None = None
+    related_tasks: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -215,7 +228,14 @@ def parse_args() -> argparse.Namespace:
         help=f"Dayflow SQLite 数据库路径。默认自动探测：{DEFAULT_DAYFLOW_DB_PATH}",
     )
     parser.add_argument("--glab-bin", default="glab", help="glab 可执行文件路径。默认：glab")
+    parser.add_argument("--lark-bin", default="lark-cli", help="lark-cli 可执行文件路径。默认：lark-cli")
     parser.add_argument("--python-bin", default=sys.executable, help="Python 可执行文件路径。默认使用当前解释器。")
+    parser.add_argument(
+        "--lark-url",
+        dest="lark_urls",
+        action="append",
+        help="可重复传入飞书项目管理 URL；支持 /wiki/、/docx/、/doc/、/base/。",
+    )
     parser.add_argument(
         "--format",
         choices=("markdown", "json"),
@@ -426,6 +446,13 @@ def resolve_gitlab_reader() -> Path:
     return script_path
 
 
+def resolve_lark_reader() -> Path:
+    script_path = Path(__file__).resolve().with_name("read_lark_project_context.py")
+    if not script_path.exists():
+        raise SystemExit(f"未找到飞书读取脚本：{script_path}")
+    return script_path
+
+
 def collect_dayflow(window: DateWindow, args: argparse.Namespace) -> dict[str, Any]:
     db_path = Path(args.dayflow_db_path).expanduser() if args.dayflow_db_path else DEFAULT_DAYFLOW_DB_PATH
     environment = detect_dayflow_environment(
@@ -493,6 +520,33 @@ def collect_gitlab(window: DateWindow, args: argparse.Namespace) -> dict[str, An
     return payload
 
 
+def collect_lark_context(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.lark_urls:
+        return {"current_user": {}, "sources": [], "tasks": [], "goals": [], "warnings": []}
+
+    reader = resolve_lark_reader()
+    command = [
+        args.python_bin,
+        str(reader),
+        "--lark-bin",
+        args.lark_bin,
+        "--indent",
+        "0",
+    ]
+    for url in args.lark_urls:
+        command.extend(["--url", url])
+    return run_json_command(command)
+
+
+def parse_optional_iso_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def is_work_card(card: dict[str, Any], include_all_cards: bool) -> bool:
     if include_all_cards:
         return True
@@ -542,12 +596,206 @@ def event_text(event: dict[str, Any]) -> str:
     push_data = event.get("push_data") or {}
     fields = [
         event.get("action_name"),
+        event.get("_project_name"),
         event.get("target_title"),
         event.get("target_type"),
         push_data.get("commit_title"),
         push_data.get("ref"),
     ]
     return normalize_text(" ".join(str(field) for field in fields if field))
+
+
+def bucket_sort_key(bucket: ThemeBucket) -> tuple[float, int, int, str]:
+    seconds = sum(max(0, card.get("duration_seconds") or 0) for card in bucket.cards)
+    return (-(seconds / 3600.0), -len(bucket.events), -(len(bucket.related_tasks or [])), bucket.label)
+
+
+def split_match_terms(values: list[str]) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for part in MATCH_SPLIT_RE.split(value):
+            normalized = normalize_text(part)
+            if len(normalized) < 2:
+                continue
+            if ASCII_WORD_RE.match(normalized) and len(normalized) < 3:
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            terms.append(normalized)
+        normalized_value = normalize_text(value)
+        if len(normalized_value) >= 3 and normalized_value not in seen:
+            seen.add(normalized_value)
+            terms.append(normalized_value)
+    return terms
+
+
+def task_is_closed(task: dict[str, Any]) -> bool:
+    status = normalize_text(task.get("status"))
+    return any(keyword in status for keyword in DONE_STATUS_KEYWORDS)
+
+
+def group_window_relevant(group: dict[str, Any], window: DateWindow) -> bool:
+    goal = group.get("goal") or {}
+    tasks = group.get("tasks") or []
+
+    dates: list[date] = []
+    for value in (
+        goal.get("start_date"),
+        goal.get("due_date"),
+        goal.get("planned_completion"),
+        goal.get("actual_completion"),
+    ):
+        parsed = parse_optional_iso_date(value)
+        if parsed:
+            dates.append(parsed)
+
+    for task in tasks:
+        for value in (task.get("start_date"), task.get("due_date")):
+            parsed = parse_optional_iso_date(value)
+            if parsed:
+                dates.append(parsed)
+
+    if any(window.start <= item <= window.end for item in dates):
+        return True
+
+    goal_due = parse_optional_iso_date(goal.get("due_date"))
+    progress = goal.get("progress")
+    if goal_due and goal_due <= window.end and progress is not None and progress < 0.999:
+        return True
+
+    return False
+
+
+def group_keywords(group: dict[str, Any]) -> list[str]:
+    goal = group.get("goal") or {}
+    tasks = group.get("tasks") or []
+    values: list[str] = []
+    for value in (goal.get("title"), goal.get("summary"), goal.get("type")):
+        if value:
+            values.append(str(value))
+    for task in tasks:
+        for value in (task.get("title"), task.get("status"), task.get("priority")):
+            if value:
+                values.append(str(value))
+    return split_match_terms(values)
+
+
+def score_group_match(text: str, keywords: list[str]) -> int:
+    score = 0
+    for keyword in keywords:
+        if keyword and keyword in text:
+            score += max(2, min(len(keyword), 8))
+    return score
+
+
+def build_lark_buckets(
+    cards: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    lark_payload: dict[str, Any],
+    window: DateWindow,
+) -> tuple[list[ThemeBucket], list[dict[str, Any]], list[dict[str, Any]]]:
+    goals = lark_payload.get("goals", [])
+    tasks = lark_payload.get("tasks", [])
+    if not goals and not tasks:
+        return [], cards, events
+
+    groups_by_goal_id: dict[str, dict[str, Any]] = {}
+    for goal in goals:
+        groups_by_goal_id[str(goal.get("goal_id"))] = {"goal": goal, "tasks": []}
+
+    standalone_groups: list[dict[str, Any]] = []
+    for task in tasks:
+        if not task.get("involves_current_user"):
+            continue
+        attached = False
+        for goal_id in task.get("goal_ids", []):
+            if goal_id in groups_by_goal_id:
+                groups_by_goal_id[goal_id]["tasks"].append(task)
+                attached = True
+                break
+        if not attached:
+            standalone_groups.append({"goal": None, "tasks": [task]})
+
+    groups: list[dict[str, Any]] = []
+    for group in groups_by_goal_id.values():
+        goal = group.get("goal") or {}
+        resource_type = str(goal.get("resource_type") or "")
+        if group["tasks"] or (resource_type in {"doc", "docx"} and not goal.get("linked_task_ids")):
+            groups.append(group)
+    groups.extend(standalone_groups)
+
+    if not groups:
+        return [], cards, events
+
+    prepared_groups = [
+        {
+            "goal": group.get("goal"),
+            "tasks": group.get("tasks", []),
+            "keywords": group_keywords(group),
+            "cards": [],
+            "events": [],
+        }
+        for group in groups
+    ]
+
+    remaining_cards: list[dict[str, Any]] = []
+    for card in cards:
+        text = card_text(card)
+        best_score = 0
+        best_group: dict[str, Any] | None = None
+        for group in prepared_groups:
+            score = score_group_match(text, group["keywords"])
+            if score > best_score:
+                best_score = score
+                best_group = group
+        if best_group and best_score >= 5:
+            best_group["cards"].append(card)
+        else:
+            remaining_cards.append(card)
+
+    remaining_events: list[dict[str, Any]] = []
+    for event in events:
+        text = event_text(event)
+        best_score = 0
+        best_group = None
+        for group in prepared_groups:
+            score = score_group_match(text, group["keywords"])
+            if score > best_score:
+                best_score = score
+                best_group = group
+        if best_group and best_score >= 5:
+            best_group["events"].append(event)
+        else:
+            remaining_events.append(event)
+
+    buckets: list[ThemeBucket] = []
+    for group in prepared_groups:
+        has_evidence = bool(group["cards"] or group["events"])
+        if not has_evidence and not group_window_relevant(group, window):
+            continue
+        goal = group.get("goal") or {}
+        related_tasks = group.get("tasks", [])
+        if goal.get("title"):
+            label = str(goal["title"]).strip()
+        elif related_tasks:
+            label = str(related_tasks[0].get("title") or "未命名事项").strip()
+        else:
+            label = FALLBACK_THEME
+        buckets.append(
+            ThemeBucket(
+                label=label,
+                cards=group["cards"],
+                events=group["events"],
+                source="lark",
+                goal_context=goal or None,
+                related_tasks=related_tasks,
+            )
+        )
+
+    ordered = sorted(buckets, key=bucket_sort_key)
+    return ordered, remaining_cards, remaining_events
 
 
 def build_theme_buckets(cards: list[dict[str, Any]], events: list[dict[str, Any]]) -> list[ThemeBucket]:
@@ -569,14 +817,7 @@ def build_theme_buckets(cards: list[dict[str, Any]], events: list[dict[str, Any]
     if not buckets:
         buckets[FALLBACK_THEME] = ThemeBucket(label=FALLBACK_THEME, cards=[], events=[])
 
-    def bucket_weight(bucket: ThemeBucket) -> tuple[float, int]:
-        seconds = sum(max(0, card.get("duration_seconds") or 0) for card in bucket.cards)
-        return (seconds / 3600.0, len(bucket.events))
-
-    ordered = sorted(
-        buckets.values(),
-        key=lambda bucket: (-bucket_weight(bucket)[0], -bucket_weight(bucket)[1], bucket.label),
-    )
+    ordered = sorted(buckets.values(), key=bucket_sort_key)
     return ordered
 
 
@@ -686,13 +927,107 @@ def display_projects(events: list[dict[str, Any]], limit: int = 3) -> list[str]:
     return [tidy_name(name) for name in project_names(events, limit=limit)]
 
 
+def dedupe_texts(values: list[str], limit: int | None = None) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = value.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+        if limit is not None and len(result) >= limit:
+            break
+    return result
+
+
 def display_titles(bucket: ThemeBucket, limit: int = 4) -> list[str]:
+    if bucket.related_tasks:
+        task_titles = dedupe_texts([str(task.get("title") or "").strip() for task in bucket.related_tasks], limit=limit)
+        if task_titles:
+            return task_titles[:limit]
     titles = top_card_titles(bucket.cards, limit=limit)
     extra_titles = [title for title in top_event_titles(bucket.events, limit=limit) if title not in titles]
     return (titles + extra_titles)[:limit]
 
 
+def project_goal_text(bucket: ThemeBucket) -> str:
+    goal = bucket.goal_context or {}
+    title = str(goal.get("title") or bucket.label).strip()
+    summary = str(goal.get("summary") or "").strip()
+    if summary and summary != title:
+        return f"围绕 {title} 推进 {summary} 对应的阶段性交付。"
+    return f"围绕 {title} 推进项目管理表中定义的阶段目标落地。"
+
+
+def project_growth_text(bucket: ThemeBucket) -> str:
+    goal = bucket.goal_context or {}
+    goal_type = str(goal.get("type") or "").strip()
+    growth_hint = LARK_GROWTH_HINTS.get(goal_type, "需求抽象、方案推进与结果闭环能力。")
+    titles = display_titles(bucket, limit=2)
+    if titles:
+        return f"在 {'、'.join(titles)} 等事项中，进一步沉淀 {growth_hint}"
+    return f"结合该阶段目标的持续推进，进一步沉淀 {growth_hint}"
+
+
+def project_delay_text(bucket: ThemeBucket, window: DateWindow) -> str:
+    goal = bucket.goal_context or {}
+    tasks = bucket.related_tasks or []
+
+    planned_completion = parse_optional_iso_date(goal.get("planned_completion"))
+    actual_completion = parse_optional_iso_date(goal.get("actual_completion"))
+    due_date = parse_optional_iso_date(goal.get("due_date"))
+    progress = goal.get("progress")
+    variance_days = goal.get("variance_days")
+
+    if planned_completion and actual_completion and actual_completion > planned_completion:
+        return (
+            f"延期情况：项目管理表显示实际完成晚于计划完成（计划 {planned_completion.isoformat()}，"
+            f"实际 {actual_completion.isoformat()}）。"
+        )
+
+    overdue_tasks = [
+        task
+        for task in tasks
+        if parse_optional_iso_date(task.get("due_date"))
+        and parse_optional_iso_date(task.get("due_date")) <= window.end
+        and not task_is_closed(task)
+    ]
+    if overdue_tasks:
+        names = "、".join(str(task.get("title") or "").strip() for task in overdue_tasks[:2])
+        return f"延期情况：{names} 等任务到期后仍需继续推进，存在阶段性顺延风险。"
+
+    if due_date and due_date <= window.end and progress is not None and progress < 0.999:
+        return f"延期情况：截至 {window.end.isoformat()}，项目管理表显示目标仍未完全闭环，存在顺延信号。"
+
+    if variance_days is not None and variance_days < 0:
+        return "延期情况：项目管理表存在负向计划偏差信号，建议评审时复核延期原因与收尾节奏。"
+
+    if due_date:
+        return f"延期情况：当前未看到明确延期证据，阶段目标计划交付时间为 {due_date.isoformat()}。"
+
+    return "延期情况：未从项目管理表、Dayflow 与 GitLab 数据中看到明确延期证据。"
+
+
+def project_stage_text(bucket: ThemeBucket) -> str:
+    goal = bucket.goal_context or {}
+    progress = goal.get("progress")
+    counts = action_counts(bucket.events)
+    accepted = counts.get("accepted", 0)
+    pushed = counts.get("pushed to", 0) + counts.get("pushed new", 0)
+
+    if accepted > 0:
+        return "阶段结果：相关事项已形成提交、评审或合入闭环，阶段交付较明确。"
+    if progress is not None and progress >= 0.8:
+        return "阶段结果：项目管理表显示推进已接近收尾，阶段成果较为清晰。"
+    if pushed > 0 or bucket.cards:
+        return "阶段结果：相关事项保持持续推进，已经形成明确的过程输出。"
+    return "阶段结果：当前以项目管理拆解推进为主，仍建议结合验收或评审结论补充闭环证明。"
+
+
 def organization_goal_text(bucket: ThemeBucket) -> str:
+    if bucket.goal_context:
+        return project_goal_text(bucket)
     projects = display_projects(bucket.events, limit=3)
     if projects:
         if bucket.label == "AI Agent与自动化工作流":
@@ -728,12 +1063,27 @@ def build_goal(bucket: ThemeBucket, journal_hints: list[str]) -> str:
     return format_bullets(
         [
             organization_goal_text(bucket),
-            PERSONAL_GROWTH_HINTS.get(bucket.label, PERSONAL_GROWTH_HINTS[FALLBACK_THEME]),
+            project_growth_text(bucket)
+            if bucket.goal_context
+            else PERSONAL_GROWTH_HINTS.get(bucket.label, PERSONAL_GROWTH_HINTS[FALLBACK_THEME]),
         ]
     )
 
 
 def build_key_results(bucket: ThemeBucket) -> str:
+    if bucket.goal_context:
+        goal = bucket.goal_context
+        lines: list[str] = []
+        if goal.get("summary"):
+            lines.append(f"对齐目标：{goal['title']}（{goal['summary']}）")
+        else:
+            lines.append(f"对齐目标：{goal.get('title') or bucket.label}")
+        task_titles = display_titles(bucket, limit=4)
+        if task_titles:
+            lines.append(f"任务交付：{'；'.join(task_titles)}")
+        lines.append(project_stage_text(bucket))
+        return format_bullets(lines)
+
     lines: list[str] = []
     projects = display_projects(bucket.events, limit=3)
     deliverables = display_titles(bucket, limit=4)
@@ -747,7 +1097,17 @@ def build_key_results(bucket: ThemeBucket) -> str:
     return format_bullets(lines)
 
 
-def build_key_actions(bucket: ThemeBucket) -> str:
+def build_key_actions(bucket: ThemeBucket, window: DateWindow) -> str:
+    if bucket.goal_context:
+        goal_title = str(bucket.goal_context.get("title") or bucket.label).strip()
+        titles = display_titles(bucket, limit=4)
+        lines: list[str] = []
+        if titles:
+            lines.append(f"关键动作：围绕 {'、'.join(titles)} 等任务分项持续推进")
+        lines.append(f"对齐组织目标：以 {goal_title} 为主线拆解并推进阶段交付")
+        lines.append(project_delay_text(bucket, window))
+        return format_bullets(lines)
+
     titles = display_titles(bucket, limit=3)
     projects = display_projects(bucket.events, limit=3)
     delay_signals = count_delay_signals(bucket.cards, bucket.events)
@@ -763,7 +1123,40 @@ def build_key_actions(bucket: ThemeBucket) -> str:
     return format_bullets(lines)
 
 
-def build_completion(bucket: ThemeBucket) -> str:
+def build_completion(bucket: ThemeBucket, window: DateWindow) -> str:
+    if bucket.goal_context:
+        titles = display_titles(bucket, limit=2)
+        risk_notes = dedupe_texts(
+            [str(task.get("risk_note") or "").strip() for task in (bucket.related_tasks or []) if task.get("risk_note")],
+            limit=2,
+        )
+
+        if bucket.events or bucket.cards:
+            success = "成效：结合项目管理拆解与实际活动轨迹，相关事项已经形成持续推进和阶段性输出。"
+        else:
+            success = "成效：项目管理表已完成任务拆解，本阶段围绕既定目标保持了持续推进。"
+
+        if risk_notes:
+            problem = f"问题：{risk_notes[0]}"
+        elif bucket.related_tasks and len(bucket.related_tasks) >= 4:
+            problem = "问题：任务拆分较多，阶段内存在一定并行推进和上下文切换。"
+        else:
+            problem = "问题：部分结果仍需补充验收、评审或发布侧的闭环证明，便于团队统一理解价值。"
+
+        delay_text = project_delay_text(bucket, window)
+        if "顺延" in delay_text or "延期" in delay_text:
+            risk = "风险：部分任务存在顺延或计划偏差信号，若验证与收尾不够集中，可能影响阶段闭环质量。"
+        elif risk_notes:
+            risk = "风险：项目管理表已标出阶段性风险点，若跟进不及时，可能影响交付节奏或结果表达。"
+        else:
+            risk = "风险：当前未见强烈延期信号，但最终业务效果仍建议结合验收或评审记录确认。"
+
+        if titles:
+            measures = f"措施：围绕 {'、'.join(titles)} 继续聚焦收尾、验证与复盘沉淀，补齐结果证明。"
+        else:
+            measures = "措施：继续补齐验收、评审与复盘信息，增强阶段结果的表达与闭环证明。"
+        return format_bullets([success, problem, risk, measures])
+
     counts = action_counts(bucket.events)
     opened = counts.get("opened", 0)
     accepted = counts.get("accepted", 0)
@@ -797,6 +1190,10 @@ def build_completion(bucket: ThemeBucket) -> str:
 
 
 def build_work_quality(bucket: ThemeBucket) -> str:
+    if bucket.goal_context:
+        progress = bucket.goal_context.get("progress")
+        if progress is not None and progress >= 0.8:
+            return "稳定：项目管理表显示推进已接近收尾，目标拆解清晰，阶段性结果表达较完整。"
     hours, _ = hours_and_days(bucket.cards)
     counts = action_counts(bucket.events)
     accepted = counts.get("accepted", 0)
@@ -820,6 +1217,8 @@ def build_difficulty(bucket: ThemeBucket) -> str:
         score += 2
     elif hours >= 16:
         score += 1
+    if bucket.related_tasks and len(bucket.related_tasks) >= 4:
+        score += 1
     if projects >= 3:
         score += 1
     if action_types >= 4:
@@ -835,15 +1234,28 @@ def build_difficulty(bucket: ThemeBucket) -> str:
 
 
 def build_notes(bucket: ThemeBucket, dayflow_available: bool) -> str:
+    notes: list[str] = []
+    uses_project_context = bool(bucket.goal_context or bucket.source == "lark")
+    if bucket.goal_context:
+        source_title = str(bucket.goal_context.get("source_title") or "飞书项目管理页").strip()
+        notes.append(f"目标已按《{source_title}》中的项目管理目标对齐。")
     if dayflow_available:
-        notes = ["工时和人天仅根据 Dayflow 数据折算；其余内容基于 Dayflow 与 GitLab 轨迹综合归纳。"]
+        if uses_project_context:
+            notes.append("工时和人天仅根据 Dayflow 数据折算；其余内容基于 Dayflow、GitLab 与飞书项目管理数据综合归纳。")
+        else:
+            notes.append("工时和人天仅根据 Dayflow 数据折算；其余内容基于 Dayflow 与 GitLab 轨迹综合归纳。")
     else:
-        notes = ["当前设备未检测到 Dayflow，本行主要依据 GitLab 轨迹归纳；工时 / D 暂无法折算。"]
-    if dayflow_available and not bucket.cards:
+        if uses_project_context:
+            notes.append("当前设备未检测到 Dayflow，本行主要依据 GitLab 与飞书项目管理数据归纳；工时 / D 暂无法折算。")
+        else:
+            notes.append("当前设备未检测到 Dayflow，本行主要依据 GitLab 轨迹归纳；工时 / D 暂无法折算。")
+    if uses_project_context and not bucket.cards and not bucket.events:
+        notes.append("本行主要依据飞书项目管理表归纳，缺少明显的 Dayflow / GitLab 轨迹佐证。")
+    elif dayflow_available and not bucket.cards:
         notes.append("本行主要依据 GitLab 轨迹归纳，缺少对应的 Dayflow 工时佐证。")
     if not dayflow_available and not bucket.events:
-        notes.append("当前既未读取到 Dayflow，也未匹配到 GitLab 记录，建议补充其他系统证据。")
-    if not bucket.events:
+        notes.append("当前既未读取到 Dayflow，也未匹配到明显的 GitLab 记录，建议补充其他系统证据。")
+    if not bucket.events and not (uses_project_context and not bucket.cards and not bucket.events):
         notes.append("本行未匹配到 GitLab 记录，可能属于非 GitLab 交付或线下推进事项。")
     notes.append("目标、质量和难易度含保守推断成分，建议结合评审材料进一步确认。")
     return format_bullets(notes)
@@ -918,6 +1330,7 @@ def build_rows(
     buckets: list[ThemeBucket],
     journal_entries: list[dict[str, Any]],
     dayflow_available: bool,
+    window: DateWindow,
 ) -> list[dict[str, str]]:
     journal_hints = collect_journal_hints(journal_entries)
     rows: list[dict[str, str]] = []
@@ -925,8 +1338,8 @@ def build_rows(
         row = {
             HEADERS[0]: build_goal(bucket, journal_hints),
             HEADERS[1]: build_key_results(bucket),
-            HEADERS[2]: build_key_actions(bucket),
-            HEADERS[3]: build_completion(bucket),
+            HEADERS[2]: build_key_actions(bucket, window),
+            HEADERS[3]: build_completion(bucket, window),
             HEADERS[4]: build_work_quality(bucket),
             HEADERS[5]: format_effort_value(bucket.cards, dayflow_available),
             HEADERS[6]: build_difficulty(bucket),
@@ -936,15 +1349,31 @@ def build_rows(
     return rows
 
 
+def build_report_buckets(
+    cards: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    lark_payload: dict[str, Any],
+    window: DateWindow,
+) -> list[ThemeBucket]:
+    lark_buckets, remaining_cards, remaining_events = build_lark_buckets(cards, events, lark_payload, window)
+    fallback_buckets = build_theme_buckets(remaining_cards, remaining_events)
+    combined = lark_buckets + fallback_buckets
+    if not combined:
+        return build_theme_buckets(cards, events)
+    return sorted(combined, key=bucket_sort_key)
+
+
 def render_markdown(
     window: DateWindow,
     rows: list[dict[str, str]],
     reflection: dict[str, str],
     dayflow_payload: dict[str, Any],
     gitlab_payload: dict[str, Any],
+    lark_payload: dict[str, Any],
 ) -> str:
     dayflow_source = dayflow_payload.get("source", {})
     dayflow_available = dayflow_is_available(dayflow_payload)
+    lark_sources = lark_payload.get("sources", [])
     if dayflow_available:
         source_lines = [
             f"数据来源：Dayflow `{dayflow_source['db_path']}` + GitLab `{gitlab_payload['source']['hostname']}`",
@@ -956,6 +1385,18 @@ def render_markdown(
             f"Dayflow：{dayflow_source.get('reason_text', '当前不可用')}（App：`{dayflow_source.get('app_path', DEFAULT_DAYFLOW_APP_PATH)}`，DB：`{dayflow_source.get('db_path', DEFAULT_DAYFLOW_DB_PATH)}`）",
             "说明：主表中每一行代表一个任务拆分；当前设备未检测到可用 Dayflow，因此本次不含工时 / D 折算。",
         ]
+    if lark_sources:
+        labels = dedupe_texts(
+            [
+                str(source.get("title") or source.get("table_name") or source.get("url") or "").strip()
+                for source in lark_sources
+            ],
+            limit=3,
+        )
+        source_lines.append(
+            f"飞书项目管理：{'、'.join(labels) if labels else f'{len(lark_sources)} 个指定 URL'}"
+        )
+        source_lines.append("说明：若提供飞书项目管理 URL，目标列优先按项目管理文档中的目标对齐。")
     lines = [
         f"# 月度工作总结（{window.label}）",
         "",
@@ -987,16 +1428,17 @@ def main() -> int:
 
     dayflow_payload = collect_dayflow(window, args)
     gitlab_payload = collect_gitlab(window, args)
+    lark_payload = collect_lark_context(args)
 
     dayflow_available = dayflow_is_available(dayflow_payload)
     cards = [card for card in dayflow_payload.get("cards", []) if is_work_card(card, args.include_all_cards)]
     events = gitlab_payload.get("events", [])
-    buckets = build_theme_buckets(cards, events)
-    rows = build_rows(buckets, dayflow_payload.get("journal_entries", []), dayflow_available)
+    buckets = build_report_buckets(cards, events, lark_payload, window)
+    rows = build_rows(buckets, dayflow_payload.get("journal_entries", []), dayflow_available, window)
     reflection = build_monthly_reflection(buckets, dayflow_payload, gitlab_payload)
 
     if args.format == "markdown":
-        sys.stdout.write(render_markdown(window, rows, reflection, dayflow_payload, gitlab_payload))
+        sys.stdout.write(render_markdown(window, rows, reflection, dayflow_payload, gitlab_payload, lark_payload))
         sys.stdout.write("\n")
         return 0
 
@@ -1009,6 +1451,13 @@ def main() -> int:
         "sources": {
             "dayflow": dayflow_payload.get("source", {}),
             "gitlab": gitlab_payload.get("source", {}),
+            "lark": lark_payload.get("sources", []),
+        },
+        "project_context": {
+            "current_user": lark_payload.get("current_user", {}),
+            "warnings": lark_payload.get("warnings", []),
+            "goal_count": len(lark_payload.get("goals", [])),
+            "task_count": len(lark_payload.get("tasks", [])),
         },
         "rows": rows,
         "monthly_reflection": reflection,

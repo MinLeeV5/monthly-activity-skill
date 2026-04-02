@@ -1,4 +1,4 @@
 interface:
   display_name: "月度工作总结"
-  short_description: "先检查 Dayflow，再汇总 Dayflow 与 GitLab 活动生成月报"
-  default_prompt: "使用 $monthly-activity-skill 汇总我指定月份的工作内容；如果设备安装了 Dayflow 就一并纳入时间线数据，否则基于 GitLab 活动生成轻量月报。"
+  short_description: "汇总 Dayflow、GitLab 与飞书项目管理 URL，生成月报"
+  default_prompt: "使用 $monthly-activity-skill 汇总我指定月份的工作内容；如果我提供了飞书项目管理 URL，就按飞书中的目标对齐“目标”列；如果设备安装了 Dayflow 就一并纳入时间线数据，否则基于 GitLab 活动生成轻量月报。"

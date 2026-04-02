@@ -50,6 +50,51 @@ class MonthlyActivitySkillTests(unittest.TestCase):
         module = load_module()
         self.assertEqual(module.format_effort_value([], dayflow_available=False), "未检测到 Dayflow，暂无法折算工时 / D")
 
+    def test_build_goal_prefers_lark_goal_context(self):
+        module = load_module()
+        bucket = module.ThemeBucket(
+            label="占位",
+            cards=[],
+            events=[],
+            source="lark",
+            goal_context={
+                "title": "新个人端 V0.2",
+                "summary": "图文 + 离线分析 + 原文编辑",
+                "type": "产品",
+            },
+            related_tasks=[{"title": "离线分析"}],
+        )
+        rendered = module.build_goal(bucket, journal_hints=[])
+        self.assertIn("新个人端 V0.2", rendered)
+        self.assertIn("图文 + 离线分析 + 原文编辑", rendered)
+
+    def test_build_lark_buckets_skips_bitable_goal_without_tasks(self):
+        module = load_module()
+        lark_payload = {
+            "goals": [
+                {
+                    "goal_id": "goal-1",
+                    "resource_type": "bitable",
+                    "title": "ONE-CLI",
+                    "summary": "不建议太早，价值不大",
+                    "linked_task_ids": [],
+                }
+            ],
+            "tasks": [],
+        }
+        buckets, remaining_cards, remaining_events = module.build_lark_buckets(
+            cards=[],
+            events=[],
+            lark_payload=lark_payload,
+            window=module.DateWindow(
+                start=module.date.fromisoformat("2026-03-01"),
+                end=module.date.fromisoformat("2026-03-31"),
+            ),
+        )
+        self.assertEqual(buckets, [])
+        self.assertEqual(remaining_cards, [])
+        self.assertEqual(remaining_events, [])
+
 
 if __name__ == "__main__":
     unittest.main()

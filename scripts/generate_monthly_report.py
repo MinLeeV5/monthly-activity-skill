@@ -676,7 +676,15 @@ def group_keywords(group: dict[str, Any]) -> list[str]:
         if value:
             values.append(str(value))
     for task in tasks:
-        for value in (task.get("title"), task.get("status"), task.get("priority")):
+        for value in (
+            task.get("title"),
+            task.get("status"),
+            task.get("priority"),
+            " ".join(str(item) for item in (task.get("mapped_goal") or [])),
+            " ".join(str(item) for item in (task.get("mapped_key_results") or [])),
+            " ".join(str(item) for item in (task.get("mapped_actions") or [])),
+            " ".join(str(item) for item in (task.get("mapped_progress") or [])),
+        ):
             if value:
                 values.append(str(value))
     return split_match_terms(values)
@@ -941,6 +949,87 @@ def dedupe_texts(values: list[str], limit: int | None = None) -> list[str]:
     return result
 
 
+def task_mapped_lines(task: dict[str, Any], field_name: str) -> list[str]:
+    value = task.get(field_name)
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return dedupe_texts([str(item).strip() for item in value if str(item).strip()])
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def bucket_mapped_lines(bucket: ThemeBucket, field_name: str) -> list[str]:
+    lines: list[str] = []
+    for task in bucket.related_tasks or []:
+        lines.extend(task_mapped_lines(task, field_name))
+    return dedupe_texts(lines)
+
+
+def bucket_has_source_mapping(bucket: ThemeBucket) -> bool:
+    return any(
+        bucket_mapped_lines(bucket, field_name)
+        for field_name in ("mapped_goal", "mapped_key_results", "mapped_actions", "mapped_progress")
+    )
+
+
+def bucket_evidence_dates(bucket: ThemeBucket) -> list[date]:
+    dates: list[date] = []
+    for card in bucket.cards:
+        parsed = parse_optional_iso_date(str(card.get("day") or ""))
+        if parsed:
+            dates.append(parsed)
+    for event in bucket.events:
+        created_at = str(event.get("created_at") or "")
+        if len(created_at) >= 10:
+            parsed = parse_optional_iso_date(created_at[:10])
+            if parsed:
+                dates.append(parsed)
+    return sorted(dates)
+
+
+def bucket_time_window_text(bucket: ThemeBucket) -> str:
+    dates = bucket_evidence_dates(bucket)
+    if not dates:
+        return ""
+    if dates[0] == dates[-1]:
+        return f"实际时间窗口：{dates[0].isoformat()}"
+    return f"实际时间窗口：{dates[0].isoformat()} 至 {dates[-1].isoformat()}"
+
+
+def simplify_progress_item(value: str) -> str:
+    text = value.strip()
+    text = re.sub(r"^\[\s*[xX]\s*\]\s*", "", text)
+    text = re.sub(r"^\[\s*\]\s*", "", text)
+    return text.strip()
+
+
+def classify_progress_items(lines: list[str]) -> dict[str, list[str]]:
+    groups = {"done": [], "pending": [], "risk": [], "adjustment": [], "conclusion": []}
+    for line in lines:
+        text = line.strip()
+        lower = text.lower()
+        if not text:
+            continue
+        if text.startswith("风险："):
+            groups["risk"].append(text)
+            continue
+        if text.startswith("调整："):
+            groups["adjustment"].append(text)
+            continue
+        if text.startswith("结论："):
+            groups["conclusion"].append(text)
+            continue
+        if "[x]" in lower or text.startswith("完成") or text.startswith("已完成"):
+            groups["done"].append(text)
+            continue
+        if "[ ]" in text or text.startswith("待办：") or "待办" in text or "未完成" in text:
+            groups["pending"].append(text)
+            continue
+        groups["pending"].append(text)
+    return groups
+
+
 def display_titles(bucket: ThemeBucket, limit: int = 4) -> list[str]:
     if bucket.related_tasks:
         task_titles = dedupe_texts([str(task.get("title") or "").strip() for task in bucket.related_tasks], limit=limit)
@@ -1060,6 +1149,15 @@ def delivery_stage_text(bucket: ThemeBucket) -> str:
 
 def build_goal(bucket: ThemeBucket, journal_hints: list[str]) -> str:
     del journal_hints
+    mapped_goals = bucket_mapped_lines(bucket, "mapped_goal")
+    if mapped_goals:
+        primary_goal = "；".join(mapped_goals[:2])
+        growth_goal = (
+            project_growth_text(bucket)
+            if bucket.goal_context
+            else PERSONAL_GROWTH_HINTS.get(bucket.label, PERSONAL_GROWTH_HINTS[FALLBACK_THEME])
+        )
+        return format_bullets([primary_goal, growth_goal])
     return format_bullets(
         [
             organization_goal_text(bucket),
@@ -1071,6 +1169,10 @@ def build_goal(bucket: ThemeBucket, journal_hints: list[str]) -> str:
 
 
 def build_key_results(bucket: ThemeBucket) -> str:
+    mapped_key_results = bucket_mapped_lines(bucket, "mapped_key_results")
+    if mapped_key_results:
+        return format_bullets(mapped_key_results)
+
     if bucket.goal_context:
         goal = bucket.goal_context
         lines: list[str] = []
@@ -1098,6 +1200,17 @@ def build_key_results(bucket: ThemeBucket) -> str:
 
 
 def build_key_actions(bucket: ThemeBucket, window: DateWindow) -> str:
+    mapped_actions = bucket_mapped_lines(bucket, "mapped_actions")
+    if mapped_actions:
+        lines = list(mapped_actions[:6])
+        if bucket.goal_context:
+            lines.append(project_delay_text(bucket, window))
+        elif count_delay_signals(bucket.cards, bucket.events) > 0:
+            lines.append("延期情况：存在少量潜在阻塞或待跟进信号，建议评审时继续复核闭环状态。")
+        else:
+            lines.append("延期情况：未从 Dayflow / GitLab 数据中看到明确延期证据。")
+        return format_bullets(lines)
+
     if bucket.goal_context:
         goal_title = str(bucket.goal_context.get("title") or bucket.label).strip()
         titles = display_titles(bucket, limit=4)
@@ -1124,6 +1237,42 @@ def build_key_actions(bucket: ThemeBucket, window: DateWindow) -> str:
 
 
 def build_completion(bucket: ThemeBucket, window: DateWindow) -> str:
+    mapped_progress = bucket_mapped_lines(bucket, "mapped_progress")
+    if mapped_progress:
+        classified = classify_progress_items(mapped_progress)
+        time_window = bucket_time_window_text(bucket)
+
+        success_parts: list[str] = []
+        if classified["done"]:
+            success_parts.append("；".join(simplify_progress_item(item) for item in classified["done"][:2]))
+        elif classified["conclusion"]:
+            success_parts.append("；".join(simplify_progress_item(item) for item in classified["conclusion"][:1]))
+        else:
+            success_parts.append("；".join(simplify_progress_item(item) for item in mapped_progress[:1]))
+        if time_window:
+            success_parts.append(time_window)
+        success = "成效：" + "；".join(part for part in success_parts if part)
+
+        problem_source = classified["adjustment"] or classified["pending"]
+        if problem_source:
+            problem = "问题：" + simplify_progress_item(problem_source[0])
+        else:
+            problem = "问题：当前来源文档未显式标出阻塞项，但仍建议结合评审和验收记录复核闭环情况。"
+
+        if classified["risk"]:
+            risk = "风险：" + simplify_progress_item(classified["risk"][0])
+        elif classified["pending"]:
+            risk = "风险：仍有待办项尚未完全收尾，若后续验证和回归不集中，可能影响阶段闭环。"
+        else:
+            risk = "风险：当前未看到明确延期信号，但最终交付结果仍建议结合评审、发布或验收记录确认。"
+
+        measure_source = classified["pending"] or classified["adjustment"]
+        if measure_source:
+            measures = "措施：" + "；".join(simplify_progress_item(item) for item in measure_source[:2])
+        else:
+            measures = "措施：继续补齐评审、验收和复盘信息，增强阶段结果表达与闭环证明。"
+        return format_bullets([success, problem, risk, measures])
+
     if bucket.goal_context:
         titles = display_titles(bucket, limit=2)
         risk_notes = dedupe_texts(
@@ -1236,6 +1385,8 @@ def build_difficulty(bucket: ThemeBucket) -> str:
 def build_notes(bucket: ThemeBucket, dayflow_available: bool) -> str:
     notes: list[str] = []
     uses_project_context = bool(bucket.goal_context or bucket.source == "lark")
+    if bucket_has_source_mapping(bucket):
+        notes.append("目标、关键交付、每周行动和完成情况优先按项目目标来源字段映射，再结合 Dayflow / GitLab 证据校准。")
     if bucket.goal_context:
         source_title = str(bucket.goal_context.get("source_title") or "飞书项目管理页").strip()
         notes.append(f"目标已按《{source_title}》中的项目管理目标对齐。")

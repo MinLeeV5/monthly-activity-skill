@@ -95,6 +95,53 @@ class MonthlyActivitySkillTests(unittest.TestCase):
         self.assertEqual(remaining_cards, [])
         self.assertEqual(remaining_events, [])
 
+    def test_build_rows_prefers_source_mapping_and_dayflow_effort(self):
+        module = load_module()
+        bucket = module.ThemeBucket(
+            label="新版个人端 V1",
+            cards=[
+                {"day": "2026-03-04", "duration_seconds": 14400},
+                {"day": "2026-03-06", "duration_seconds": 14400},
+            ],
+            events=[
+                {
+                    "created_at": "2026-03-07T10:00:00Z",
+                    "action_name": "pushed to",
+                    "target_title": "录制链路切换",
+                }
+            ],
+            source="lark",
+            related_tasks=[
+                {
+                    "title": "新版个人端 V1 —— 3.6",
+                    "mapped_goal": ["新版个人端 V1 —— 3.6"],
+                    "mapped_key_results": ["完成录制链路切换", "完成查看页改版"],
+                    "mapped_actions": ["完成接口联调 3.4", "完成 UI 评审 3.5"],
+                    "mapped_progress": [
+                        "- [x] 完成接口联调 3.4",
+                        "- [ ] 完成 UI 联调 3.6",
+                        "待办：补齐截图回归",
+                    ],
+                }
+            ],
+        )
+        rows = module.build_rows(
+            buckets=[bucket],
+            journal_entries=[],
+            dayflow_available=True,
+            window=module.DateWindow(
+                start=module.date.fromisoformat("2026-03-01"),
+                end=module.date.fromisoformat("2026-03-31"),
+            ),
+        )
+        row = rows[0]
+        self.assertIn("新版个人端 V1 —— 3.6", row[module.HEADERS[0]])
+        self.assertIn("完成录制链路切换", row[module.HEADERS[1]])
+        self.assertIn("完成接口联调 3.4", row[module.HEADERS[2]])
+        self.assertIn("待办：补齐截图回归", row[module.HEADERS[3]])
+        self.assertIn("2026-03-04", row[module.HEADERS[3]])
+        self.assertEqual(row[module.HEADERS[5]], "8.00 小时 / 1.00 D")
+
 
 if __name__ == "__main__":
     unittest.main()

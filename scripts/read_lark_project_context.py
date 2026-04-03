@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import subprocess
@@ -19,6 +20,26 @@ GOAL_TITLE_HINTS = ("里程碑", "目标", "项目", "标题", "名称", "版本
 GOAL_DETAIL_HINTS = ("内容", "说明", "描述", "范围", "备注")
 OWNER_FIELD_HINTS = ("负责人", "主导人", "前端研发", "后端研发", "owner")
 DOC_GOAL_HEADING_HINTS = ("目标", "里程碑", "交付", "范围", "计划", "方向")
+TASK_GOAL_FIELD_HINTS = ("团队目标", "周目标", "目标")
+TASK_KEY_RESULT_FIELD_HINTS = ("关键交付", "关键成果", "交付")
+TASK_ACTION_FIELD_HINTS = ("每周行动", "关键行动", "关键举措", "目标分解", "关键里程碑计划", "行动")
+TASK_PROGRESS_FIELD_HINTS = ("完成情况", "当前进展", "进展")
+DOC_TABLE_GOAL_COLUMN_HINTS = ("团队目标", "周目标", "目标")
+DOC_TABLE_ACTION_COLUMN_HINTS = ("目标分解", "关键里程碑计划", "每周行动", "关键行动", "关键举措")
+DOC_SECTION_LABELS = (
+    "目标",
+    "交付",
+    "关键交付",
+    "关键成果",
+    "待办",
+    "调整",
+    "结论",
+    "风险",
+    "背景",
+    "价值",
+    "内容",
+    "依赖",
+)
 EXCEL_EPOCH = date(1899, 12, 30)
 
 
@@ -166,6 +187,28 @@ def first_nonempty(record: dict[str, Any], field_names: tuple[str, ...] | list[s
         if text:
             return text
     return ""
+
+
+def collect_matching_field_texts(record: dict[str, Any], field_hints: tuple[str, ...]) -> list[str]:
+    values: list[str] = []
+    for field_name, value in record.items():
+        if field_name.startswith("_"):
+            continue
+        if not any(hint in field_name for hint in field_hints):
+            continue
+        text = stringify_value(value)
+        if text:
+            values.extend(split_plain_lines(text) or [text])
+    return values
+
+
+def split_plain_lines(value: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in value.splitlines():
+        cleaned = " ".join(raw_line.split())
+        if cleaned:
+            lines.append(cleaned)
+    return lines
 
 
 def build_keywords(*values: Any) -> list[str]:
@@ -437,6 +480,10 @@ def normalize_task_entries(
             "goal_ids": extract_link_ids(record, goal_field_names),
             "owner_names": sorted(name for name in owner_names if name),
             "owner_ids": sorted(identifier for identifier in owner_ids if identifier),
+            "mapped_goal": collect_matching_field_texts(record, TASK_GOAL_FIELD_HINTS),
+            "mapped_key_results": collect_matching_field_texts(record, TASK_KEY_RESULT_FIELD_HINTS),
+            "mapped_actions": collect_matching_field_texts(record, TASK_ACTION_FIELD_HINTS),
+            "mapped_progress": collect_matching_field_texts(record, TASK_PROGRESS_FIELD_HINTS),
         }
         entry["involves_current_user"] = bool(
             current_user.get("name") and current_user["name"] in entry["owner_names"]
@@ -451,6 +498,216 @@ def normalize_task_entries(
         )
         entries.append(entry)
     return entries
+
+
+def strip_markers(value: str) -> str:
+    text = value
+    text = re.sub(r"<mention-doc [^>]*>(.*?)</mention-doc>", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"<mention-user[^>]*/>", "", text)
+    text = re.sub(r"<image[^>]*/>", "", text)
+    text = re.sub(r"</?text[^>]*>", "", text)
+    text = re.sub(r"</?callout[^>]*>", "", text)
+    text = re.sub(r"</?lark-[^>]*>", "", text)
+    text = html.unescape(text)
+    text = re.sub(r"[*_~`]+", "", text)
+    return text
+
+
+def extract_mention_user_ids(value: str) -> list[str]:
+    return [item.strip() for item in re.findall(r'<mention-user[^>]*id="([^"]+)"', value) if item.strip()]
+
+
+def normalize_doc_cell_lines(value: str) -> list[str]:
+    text = strip_markers(value)
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        cleaned = strip_markdown(raw_line)
+        cleaned = " ".join(cleaned.split())
+        if cleaned:
+            lines.append(cleaned)
+    return lines
+
+
+def parse_doc_month_heading(heading: str) -> tuple[str, str] | None:
+    match = re.search(r"(?P<year>\d{2,4})[-/年](?P<month>\d{1,2})", heading)
+    if not match:
+        return None
+    year = int(match.group("year"))
+    if year < 100:
+        year += 2000
+    month = int(match.group("month"))
+    if not 1 <= month <= 12:
+        return None
+    start = date(year, month, 1)
+    if month == 12:
+        end = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        end = date(year, month + 1, 1) - timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
+def nearest_doc_heading(markdown: str, position: int) -> str:
+    heading = ""
+    for match in re.finditer(r"(?m)^#\s+(.+)$", markdown):
+        if match.start() >= position:
+            break
+        heading = strip_markdown(match.group(1))
+    return heading
+
+
+def parse_doc_table_rows(table_block: str) -> list[list[dict[str, Any]]]:
+    rows: list[list[dict[str, Any]]] = []
+    for row_match in re.finditer(r"<lark-tr>(.*?)</lark-tr>", table_block, flags=re.DOTALL):
+        cells: list[dict[str, Any]] = []
+        for cell_match in re.finditer(r"<lark-td>(.*?)</lark-td>", row_match.group(1), flags=re.DOTALL):
+            raw = cell_match.group(1)
+            cells.append(
+                {
+                    "raw": raw,
+                    "lines": normalize_doc_cell_lines(raw),
+                    "user_ids": extract_mention_user_ids(raw),
+                }
+            )
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+def doc_cell_text(cell: dict[str, Any]) -> str:
+    return " ".join(cell.get("lines", []))
+
+
+def find_doc_column_index(header_cells: list[dict[str, Any]], hints: tuple[str, ...]) -> int | None:
+    for index, cell in enumerate(header_cells):
+        text = doc_cell_text(cell)
+        if any(hint in text for hint in hints):
+            return index
+    return None
+
+
+def split_doc_sections(lines: list[str]) -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {"_leading": []}
+    current = "_leading"
+    for line in lines:
+        matched_label = None
+        remainder = line
+        for label in DOC_SECTION_LABELS:
+            prefix = f"{label}："
+            if line.startswith(prefix):
+                matched_label = label
+                remainder = line[len(prefix) :].strip()
+                break
+        if matched_label:
+            current = matched_label
+            sections.setdefault(current, [])
+            if remainder:
+                sections[current].append(remainder)
+            continue
+        sections.setdefault(current, []).append(line)
+    return sections
+
+
+def flatten_doc_sections(sections: dict[str, list[str]], keep_labels: bool) -> list[str]:
+    lines: list[str] = []
+    for key, values in sections.items():
+        if key == "_leading":
+            lines.extend(values)
+            continue
+        if keep_labels:
+            if not values:
+                lines.append(f"{key}：")
+            else:
+                lines.extend(f"{key}：{value}" for value in values)
+            continue
+        lines.extend(values)
+    return lines
+
+
+def extract_doc_tasks(
+    title: str,
+    markdown: str,
+    resource: dict[str, Any],
+    current_user: dict[str, str],
+) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    for table_match in re.finditer(r"<lark-table\b.*?</lark-table>", markdown, flags=re.DOTALL):
+        heading = nearest_doc_heading(markdown, table_match.start())
+        month_window = parse_doc_month_heading(heading)
+        rows = parse_doc_table_rows(table_match.group(0))
+        if len(rows) < 2:
+            continue
+        header = rows[0]
+        goal_index = find_doc_column_index(header, DOC_TABLE_GOAL_COLUMN_HINTS)
+        owner_index = find_doc_column_index(header, ("负责人",))
+        action_index = find_doc_column_index(header, DOC_TABLE_ACTION_COLUMN_HINTS)
+        if goal_index is None or owner_index is None:
+            continue
+
+        for row in rows[1:]:
+            if owner_index >= len(row):
+                continue
+            owner_ids = row[owner_index].get("user_ids", [])
+            if current_user.get("open_id") and current_user["open_id"] not in owner_ids:
+                continue
+
+            goal_cell = row[goal_index] if goal_index < len(row) else {"lines": []}
+            action_cell = row[action_index] if action_index is not None and action_index < len(row) else {"lines": []}
+            progress_cells = row[action_index + 1 :] if action_index is not None and action_index + 1 < len(row) else []
+
+            goal_sections = split_doc_sections(goal_cell.get("lines", []))
+            action_sections = split_doc_sections(action_cell.get("lines", []))
+            progress_sections = [split_doc_sections(cell.get("lines", [])) for cell in progress_cells]
+
+            title_candidates = goal_sections.get("_leading", [])
+            row_title = title_candidates[0] if title_candidates else ""
+            mapped_goal = [row_title] if row_title else []
+            mapped_goal.extend(goal_sections.get("目标", []))
+            mapped_key_results = (
+                goal_sections.get("关键交付", [])
+                or goal_sections.get("关键成果", [])
+                or goal_sections.get("交付", [])
+            )
+            mapped_actions = flatten_doc_sections(action_sections, keep_labels=True)
+            mapped_progress: list[str] = []
+            for sections in progress_sections:
+                mapped_progress.extend(flatten_doc_sections(sections, keep_labels=True))
+
+            if not row_title and not mapped_key_results and not mapped_actions and not mapped_progress:
+                continue
+
+            start_date = month_window[0] if month_window else None
+            due_date = month_window[1] if month_window else None
+            entry = {
+                "task_id": f"{resource['source_url']}#{heading or title}#{len(tasks)}",
+                "source_url": resource["source_url"],
+                "source_title": title,
+                "resource_type": resource.get("resource_type"),
+                "title": row_title or f"文档事项#{len(tasks) + 1}",
+                "status": "",
+                "priority": "",
+                "start_date": start_date,
+                "due_date": due_date,
+                "risk_note": "",
+                "risk_flag": "",
+                "goal_ids": [],
+                "goal_titles": [],
+                "owner_names": [],
+                "owner_ids": owner_ids,
+                "involves_current_user": True,
+                "mapped_goal": mapped_goal,
+                "mapped_key_results": mapped_key_results,
+                "mapped_actions": mapped_actions,
+                "mapped_progress": mapped_progress,
+            }
+            entry["keywords"] = build_keywords(
+                entry["title"],
+                " ".join(entry["mapped_goal"]),
+                " ".join(entry["mapped_key_results"]),
+                " ".join(entry["mapped_actions"]),
+                " ".join(entry["mapped_progress"]),
+            )
+            tasks.append(entry)
+    return tasks
 
 
 def normalize_goal_entries(
@@ -652,7 +909,7 @@ def extract_doc_goals(title: str, markdown: str, resource: dict[str, Any]) -> li
     ]
 
 
-def fetch_doc_context(resource: dict[str, Any], lark_bin: str) -> dict[str, Any]:
+def fetch_doc_context(resource: dict[str, Any], lark_bin: str, current_user: dict[str, str]) -> dict[str, Any]:
     offset = 0
     title = resource.get("title") or ""
     markdown_chunks: list[str] = []
@@ -685,7 +942,8 @@ def fetch_doc_context(resource: dict[str, Any], lark_bin: str) -> dict[str, Any]
         offset = next_offset
 
     markdown = "\n".join(chunk for chunk in markdown_chunks if chunk)
-    goals = extract_doc_goals(title, markdown, resource)
+    tasks = extract_doc_tasks(title, markdown, resource, current_user)
+    goals = [] if tasks else extract_doc_goals(title, markdown, resource)
     source = {
         "url": resource["source_url"],
         "resource_type": resource["resource_type"],
@@ -697,7 +955,7 @@ def fetch_doc_context(resource: dict[str, Any], lark_bin: str) -> dict[str, Any]
         "goal_table_id": None,
         "goal_table_name": None,
     }
-    return {"sources": [source], "tasks": [], "goals": goals, "warnings": []}
+    return {"sources": [source], "tasks": tasks, "goals": goals, "warnings": []}
 
 
 def collect_from_url(url: str, lark_bin: str, current_user: dict[str, str]) -> dict[str, Any]:
@@ -705,7 +963,7 @@ def collect_from_url(url: str, lark_bin: str, current_user: dict[str, str]) -> d
     if resource["resource_type"] == "bitable":
         return fetch_bitable_context(resource, lark_bin, current_user)
     if resource["resource_type"] in {"doc", "docx"}:
-        return fetch_doc_context(resource, lark_bin)
+        return fetch_doc_context(resource, lark_bin, current_user)
 
     source = {
         "url": resource["source_url"],

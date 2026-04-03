@@ -48,6 +48,58 @@ class ReadLarkProjectContextTests(unittest.TestCase):
         self.assertEqual(goals[0]["title"], "项目目标")
         self.assertIn("完成个人端录屏能力切换", goals[0]["summary"])
 
+    def test_extract_doc_tasks_parses_weekly_table_for_current_user(self):
+        module = load_module()
+        markdown = """# 26-03
+
+<lark-table rows="2" cols="6" header-row="true" header-column="true">
+  <lark-tr>
+    <lark-td>产品类别</lark-td>
+    <lark-td>团队目标</lark-td>
+    <lark-td>负责人</lark-td>
+    <lark-td>共担人</lark-td>
+    <lark-td>目标分解&关键里程碑计划</lark-td>
+    <lark-td>3.3 ～ 3.9</lark-td>
+  </lark-tr>
+  <lark-tr>
+    <lark-td>会记</lark-td>
+    <lark-td>
+      **新版个人端 V1 —— 3.6**
+      交付：
+      - 完成录制链路切换
+      - 完成查看页改版
+    </lark-td>
+    <lark-td><mention-user id="ou_current"/></lark-td>
+    <lark-td></lark-td>
+    <lark-td>
+      - 完成接口联调 3.4
+      - 完成 UI 评审 3.5
+    </lark-td>
+    <lark-td>
+      - [x] 完成接口联调 3.4
+      - [ ] 完成 UI 联调 3.6
+      待办：补齐截图回归
+      调整：查看页交互延后到 3.8
+    </lark-td>
+  </lark-tr>
+</lark-table>
+"""
+        tasks = module.extract_doc_tasks(
+            title="智能会议项目周会-归档",
+            markdown=markdown,
+            resource={"source_url": "https://example.com/wiki/weekly", "resource_type": "docx"},
+            current_user={"name": "李伟民", "open_id": "ou_current"},
+        )
+        self.assertEqual(len(tasks), 1)
+        task = tasks[0]
+        self.assertEqual(task["title"], "新版个人端 V1 —— 3.6")
+        self.assertEqual(task["start_date"], "2026-03-01")
+        self.assertEqual(task["due_date"], "2026-03-31")
+        self.assertIn("新版个人端 V1 —— 3.6", task["mapped_goal"])
+        self.assertIn("完成录制链路切换", task["mapped_key_results"])
+        self.assertIn("完成接口联调 3.4", task["mapped_actions"])
+        self.assertIn("待办：补齐截图回归", task["mapped_progress"])
+
 
 if __name__ == "__main__":
     unittest.main()
